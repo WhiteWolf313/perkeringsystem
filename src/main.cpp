@@ -1,9 +1,3 @@
-/*
- * SMART PARKING SYSTEM - FELSÖKNINGSVERSION (Buzzer på Pin 15, Sensor-logg)
- * Hårdvara: ESP32 DevKitC V4 (38-pin), 2x RFID, 2x Servo, 2x LCD, 4x HC-SR04, 1x Buzzer
- * Databas: Redis via Wi-Fi (med LittleFS Offline-stöd)
- */
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -18,13 +12,13 @@
 // =======================================================
 // 1. INSTÄLLNINGAR & VARIABLER
 // =======================================================
-const char* ssid = "TN_wifi_A28B37";
-const char* password = "5D35C2E6D2";
-const char* redis_host = "192.168.10.199";
+const char* ssid = "DITT_WIFI_NAMN";
+const char* password = "DITT_WIFI_LOSENORD";
+const char* redis_host = "192.168.1.100"; 
 const int redis_port = 6379;
 const char* queueFile = "/queue.txt";
 
-int freeSpots = 50; 
+int freeSpots = 10; 
 WiFiClient redisClient;
 
 std::map<String, unsigned long> parkeringstider;
@@ -33,7 +27,7 @@ std::map<String, unsigned long> parkeringstider;
 // 2. PIN-DEFINITIONER
 // =======================================================
 #define BUZZER_PIN 15 // <--- UPPDATERAD TILL PIN 15!
-
+#define BUZZER_CHANNEL 7  // added channel this to not mix signal with servo
 #define RST_PIN 27
 #define SS_IN_PIN 5
 #define SS_OUT_PIN 4
@@ -48,7 +42,7 @@ std::map<String, unsigned long> parkeringstider;
 
 #define TRIG_OUT_BEFORE 25
 #define ECHO_OUT_BEFORE 36
-#define TRIG_OUT_AFTER 26
+#define TRIG_OUT_AFTER 16   //was 26
 #define ECHO_OUT_AFTER 39
 
 // =======================================================
@@ -87,18 +81,21 @@ long getDistance(int trigPin, int echoPin) {
   return duration * 0.034 / 2;
 }
 
-void beep(int duration, int times = 1) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(BUZZER_PIN, LOW); // LOW = PIPER (Eftersom den är Active LOW)
-    delay(duration);
-    digitalWrite(BUZZER_PIN, HIGH); // HIGH = TYST
-    if (times > 1) delay(100); 
-  }
+// Simple tone implementation for ESP32   , 
+void initBuzzer() {
+  // ONE TIME SETUP - never change these again!
+  ledcSetup(BUZZER_CHANNEL, 2000, 8);  // Setup once
+  ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
+  ledcWrite(BUZZER_CHANNEL, 0);
 }
 
-void initBuzzer() {
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, HIGH); // Tvinga den att vara tyst vid start
+void beep(int duration, int times = 1) {
+  for (int i = 0; i < times; i++) {
+    ledcWriteTone(BUZZER_CHANNEL, 2000);  // Start tone
+    delay(duration);
+    ledcWrite(BUZZER_CHANNEL, 0);  // Stop tone
+    if (times > 1 && i < times-1) delay(100);
+  }
 }
 
 void initLCD() {
@@ -233,46 +230,71 @@ void setup() {
 void loop() {
   
   // --- KOLLA BILAR (Sensorer) ---
-  if (millis() - lastSensorCheck > 1000) { // Ändrade till 1 sekund för att minska spam i loggen
-    long distIn = getDistance(TRIG_IN_BEFORE, ECHO_IN_BEFORE);
-    long distOut = getDistance(TRIG_OUT_BEFORE, ECHO_OUT_BEFORE);
+  if (millis() - lastSensorCheck > 1000) { 
+    // Jeder Sensor braucht einen eigenen, eindeutigen Variablennamen
+    long distInBefore = getDistance(TRIG_IN_BEFORE, ECHO_IN_BEFORE);
+    long distInAfter  = getDistance(TRIG_IN_AFTER, ECHO_IN_AFTER);
+    long distOutBefore = getDistance(TRIG_OUT_BEFORE, ECHO_OUT_BEFORE);
+    long distOutAfter  = getDistance(TRIG_OUT_AFTER, ECHO_OUT_AFTER);
 
-    // NYTT FÖR FELSÖKNING: Skriver ut avståndet i Serial Monitor
-    Serial.print("Avstånd IN: "); Serial.print(distIn); Serial.print(" cm | ");
-    Serial.print("Avstånd UT: "); Serial.print(distOut); Serial.println(" cm");
+    // Ausgabe aller 4 Werte in einer Zeile zur besseren Übersicht
+    Serial.print("IN - Vorher: "); Serial.print(distInBefore); Serial.print(" cm, Nachher: "); Serial.print(distInAfter);
+    Serial.print(" | UT - Vorher: "); Serial.print(distOutBefore); Serial.print(" cm, Nachher: "); Serial.print(distOutAfter);
+    Serial.println(" cm");
 
     // ÄNDRAT TILL 5 cm FÖR TEST
-    if (distIn <= 5 && !carAtInBefore) { carAtInBefore = true; beep(100); } 
-    else if (distIn > 5) { carAtInBefore = false; }
+    if (distInBefore <= 5 && !carAtInBefore) { carAtInBefore = true; beep(100); } 
+    else if (distInBefore > 5) { carAtInBefore = false; }
 
-    if (distOut <= 5 && !carAtOutBefore) { carAtOutBefore = true; beep(100); } 
-    else if (distOut > 5) { carAtOutBefore = false; }
+    if (distOutBefore <= 5 && !carAtOutBefore) { carAtOutBefore = true; beep(100); } 
+    else if (distOutBefore > 5) { carAtOutBefore = false; }
     
     lastSensorCheck = millis();
   }
 
-  // --- HANTERA INGÅNG (Kortläsare) ---
-  if (!gateInOpen && rfidIn.PICC_IsNewCardPresent() && rfidIn.PICC_ReadCardSerial()) {
-    beep(50);
-    String uid = getUID(rfidIn);
-    if (checkAccess(uid)) {
-      freeSpots--;
-      logPassage(uid, "IN");
-      parkeringstider[uid] = millis();
-      lcdIn.clear(); lcdIn.print("Valkommen!");
-      beep(100, 2);
-      servoIn.write(90); 
-      gateInOpen = true;
-      gateInTimer = millis(); 
-    } else {
-      lcdIn.clear(); lcdIn.print("Nekad Access!");
-      beep(500); 
-    }
-    rfidIn.PICC_HaltA();
+// --- HANTERA INGÅNG (Kortläsare) ---
+if (!gateInOpen && rfidIn.PICC_IsNewCardPresent() && rfidIn.PICC_ReadCardSerial()) {
+  beep(50);
+  String uid = getUID(rfidIn);
+  
+  // DIRECT CHECK - No function needed
+  if (freeSpots <= 0) {
+    lcdIn.clear(); 
+    lcdIn.print("PARKERING FULL!");
+    lcdIn.setCursor(0, 1);
+    lcdIn.print("Ingen plats");
+    beep(500, 3);
+    Serial.println("Access DENIED - Parking full!");
   }
+  else if (checkAccess(uid)) {
+    freeSpots--;
+    logPassage(uid, "IN");
+    parkeringstider[uid] = millis();
+    lcdIn.clear(); 
+    lcdIn.print("Valkommen!");
+    lcdIn.setCursor(0, 1);
+    lcdIn.print("Platser kvar: " + String(freeSpots));
+    beep(100, 2);
+    servoIn.write(90); 
+    gateInOpen = true;
+    gateInTimer = millis();
+    updateDisplays();
+    Serial.printf("Access GRANTED - Free spots: %d\n", freeSpots);
+  } 
+  else {
+    lcdIn.clear(); 
+    lcdIn.print("Nekad Access!");
+    lcdIn.setCursor(0, 1);
+    lcdIn.print("Ogiltigt kort");
+    beep(500);
+    Serial.println("Access DENIED - Invalid card");
+  }
+  
+  rfidIn.PICC_HaltA();
+}
 
   // --- HANTERA INGÅNGENS BOM ---
-  if (gateInOpen && (millis() - gateInTimer > 3000)) { 
+  if (gateInOpen && (millis() - gateInTimer > 10000)) { 
     long carPassedDist = getDistance(TRIG_IN_AFTER, ECHO_IN_AFTER);
     if (carPassedDist > 5) { // ÄNDRAT TILL 5 cm FÖR TEST
       servoIn.write(0); 
@@ -302,7 +324,7 @@ void loop() {
         parkeringstider.erase(uid); 
       }
       lcdOut.clear(); 
-      lcdOut.setCursor(0, 0); lcdOut.print("Tack for besoket");
+      lcdOut.setCursor(0, 0); lcdOut.print ("Tack for besoket");
       lcdOut.setCursor(0, 1); lcdOut.print(timeMsg);
       beep(100, 2);
       servoOut.write(90); 
@@ -316,7 +338,7 @@ void loop() {
   }
 
   // --- HANTERA UTGÅNGENS BOM ---
-  if (gateOutOpen && (millis() - gateOutTimer > 3000)) {
+  if (gateOutOpen && (millis() - gateOutTimer > 10000)) {
     long carPassedDist = getDistance(TRIG_OUT_AFTER, ECHO_OUT_AFTER);
     if (carPassedDist > 5) { // ÄNDRAT TILL 5 cm FÖR TEST
       servoOut.write(0); 
